@@ -1,102 +1,102 @@
 # tsdb-gorilla
 
-In-memory time-series database in Go with Gorilla compression, a group-commit
-write-ahead log and an InfluxDB-style ingest API. Built to answer one question:
-how many samples per second can a single Go process accept durably, and how small
-can they be kept in RAM.
+Хранилище временных рядов в памяти на Go: сжатие Gorilla, журнал упреждающей записи с
+групповым коммитом и приём данных в формате InfluxDB. Проект отвечает на один вопрос:
+сколько точек в секунду один процесс на Go может принять с гарантией сохранности и насколько
+компактно их можно держать в RAM.
 
-![benchmarks](docs/bench.png)
+![Бенчмарки](docs/bench.png)
 
 | | |
 |---|---|
-| Ingest over HTTP, WAL on | **~10.0M samples/s** (6.4k requests/s, p99 16 ms) |
-| Ingest with fsync per group commit | **8.7M samples/s** |
-| Memory per sample | **3.1 bytes** on a realistic fleet mix, 0.4–1.3 bytes for counters and flat gauges (raw is 16) |
-| Aggregating queries (1 h, 1 min avg) | **53k/s**, p99 1.1 ms |
-| Crash recovery | 200M samples / 3.6 GB WAL replayed in 57 s |
+| Приём по HTTP, WAL включён | **~10,0 млн точек/с** (6,4 тыс. запросов/с, p99 16 мс) |
+| Приём с fsync на каждый групповой коммит | **8,7 млн точек/с** |
+| Память на точку | **3,1 байта** на реалистичном наборе метрик, 0,4–1,3 байта для счётчиков и ровных датчиков (без сжатия 16) |
+| Агрегирующие запросы (1 ч, среднее за 1 мин) | **53 тыс./с**, p99 1,1 мс |
+| Восстановление после сбоя | 200 млн точек, WAL 3,6 ГБ проигрывается за 57 с |
 
-Numbers from `cmd/loadgen` against `cmd/server` on one laptop (i7-13620H):
-10 000 hosts x 10 metrics = 100 000 series, 200M samples in 20 s.
+Замеры `cmd/loadgen` против `cmd/server` на одном ноутбуке (i7-13620H):
+10 000 хостов по 10 метрик, то есть 100 000 рядов, 200 млн точек за 20 с.
 
-## How it works
+## Как устроено
 
 ```
- HTTP /write ─┐                    ┌─► WAL writer goroutine ── one write(2) + one fsync per batch
- UDP :8089  ──┼─► body ── Write ───┘        (up to 512 requests merged)
+ HTTP /write ─┐                    ┌─► горутина WAL ── один write(2) и один fsync на пакет
+ UDP :8089  ──┼─► тело ── Write ───┘        (до 512 запросов вместе)
               │
-              └─► lineproto.Parser (0 allocs) ──► store: 256 shards ─► Series
-                                                                      ├ sealed chunks (immutable, 120 samples)
-                                                                      └ head encoder (Gorilla, mutable)
+              └─► lineproto.Parser (0 аллокаций) ──► store: 256 шардов ─► Series
+                                                                      ├ закрытые чанки (неизменяемые, по 120 точек)
+                                                                      └ головной кодер (Gorilla, изменяемый)
 ```
 
-**Compression** (`internal/gorilla`). Timestamps are stored as delta-of-delta with
-four variable-width buckets, so a steady scrape interval costs 1 bit per sample.
-Values are XORed with the previous value; unchanged values cost 1 bit, and when the
-meaningful bits fit the previous window only the middle bits are written. Encoding
-takes 14 ns and decoding 22 ns per sample. Round-trip is property-tested on random
-streams including NaN, Inf and 2^40 ms gaps, plus every bucket boundary.
+**Сжатие** (`internal/gorilla`). Метки времени хранятся как разность разностей в четырёх
+корзинах переменной ширины, поэтому ровный интервал опроса стоит 1 бит на точку. Значение
+складывается по XOR с предыдущим: неизменное значение стоит 1 бит, а если значащие биты
+укладываются в прошлое окно, пишется только середина. Кодирование 14 нс, декодирование 22 нс
+на точку. Прямое и обратное преобразование проверяются на случайных потоках, включая NaN,
+Inf, разрывы в 2^40 мс и все границы корзин.
 
-**Storage** (`internal/store`). Series live in 256 shards keyed by `maphash`, so
-writers on different series never share a lock. Every 120 samples the head chunk is
-sealed and shrunk to fit. Readers copy only the head under the series lock and decode
-sealed chunks lock-free. Parallel append costs 48 ns with zero allocations.
+**Хранение** (`internal/store`). Ряды разложены по 256 шардам по `maphash`, поэтому
+писатели разных рядов никогда не делят блокировку. Каждые 120 точек головной чанк
+закрывается и ужимается по размеру. Читатель под блокировкой ряда копирует только голову,
+закрытые чанки декодирует без блокировок. Параллельная дозапись стоит 48 нс без аллокаций.
 
-**Durability** (`internal/wal`). A request is acknowledged only after its bytes are in
-the WAL. A single writer goroutine drains the queue, so under load one fsync covers
-dozens of requests: that is why fsync mode loses only 13 % of throughput. Records are
-`len | crc32c | payload`; a torn tail from a crash is detected and truncated on
-replay. Segments rotate at 64 MB and are deleted once they fall out of retention.
+**Сохранность** (`internal/wal`). Запрос подтверждается только после того, как его байты
+попали в WAL. Очередь разбирает одна горутина, поэтому под нагрузкой один fsync покрывает
+десятки запросов, и режим с fsync теряет всего 13 % пропускной способности. Записи имеют вид
+`len | crc32c | payload`, оборванный после сбоя хвост находится и обрезается при
+проигрывании. Сегменты ротируются по 64 МБ и удаляются, когда выходят за срок хранения.
 
-**Queries**. `raw`, `avg`, `min`, `max`, `sum`, `count`, `last` and `rate` over
-step-aligned windows. `rate` handles counter resets the same way Prometheus does.
-Aggregates are checked against a naive implementation in tests.
+**Запросы.** `raw`, `avg`, `min`, `max`, `sum`, `count`, `last` и `rate` по окнам,
+выровненным на шаг. `rate` обрабатывает сброс счётчика так же, как Prometheus. Агрегаты
+в тестах сверяются с наивной реализацией.
 
 ## API
 
 ```bash
-# write: InfluxDB line protocol, timestamps in ms (optional, defaults to now)
+# запись: line protocol InfluxDB, метки времени в мс (необязательны, по умолчанию сейчас)
 curl -X POST localhost:8428/write --data-binary \
   'host,dc=eu,id=web1 cpu_user=12.5,http_requests=18231i 1727700000000'
 
-# query: 1-minute averages over the last hour
+# запрос: средние по минутам за последний час
 curl 'localhost:8428/query?series=host.cpu_user{dc=eu,id=web1}&step=60000&agg=avg'
 
 curl 'localhost:8428/series?prefix=host.cpu&limit=20'
-curl localhost:8428/stats      # series, bytes per sample, rejected, dropped
-curl localhost:8428/metrics    # Prometheus: ingest counters, write and query latency histograms
+curl localhost:8428/stats      # ряды, байт на точку, отклонённые, отброшенные
+curl localhost:8428/metrics    # Prometheus: счётчики приёма, гистограммы задержек записи и запросов
 ```
 
-Each numeric field becomes its own series named `measurement.field{sorted tags}`.
-Out-of-order and duplicate timestamps are rejected and counted.
+Каждое числовое поле становится отдельным рядом с именем `measurement.field{теги по
+алфавиту}`. Точки не по порядку и повторы по времени отклоняются и считаются.
 
-## Run
+## Запуск
 
 ```bash
-make run                          # server on :8428, UDP on :8089, WAL in data/wal
-make load                         # 100k series load test, then query phase
+make run                          # сервер на :8428, UDP на :8089, WAL в data/wal
+make load                         # нагрузка на 100 тыс. рядов, затем фаза запросов
 make test && make bench
 docker build -t tsdb-gorilla . && docker run -p 8428:8428 -v tsdb:/data tsdb-gorilla
 ```
 
-Flags: `-fsync` for fsync on every group commit, `-retention 24h`, `-wal ""` for a
-purely in-memory run.
+Флаги: `-fsync` включает fsync на каждый групповой коммит, `-retention 24h` задаёт срок
+хранения, `-wal ""` запускает всё только в памяти.
 
-## Layout
+## Раскладка
 
 ```
-cmd/server      HTTP + UDP ingest, queries, retention janitor, WAL pruning, Prometheus metrics
-cmd/loadgen     fleet simulator: gauges, counters, rare errors; write and query phases
-internal/gorilla   bit stream, encoder, iterator
-internal/store     sharded series map, chunks, aggregation, retention
-internal/lineproto zero-allocation line protocol parser
-internal/wal       segmented group-commit WAL with torn-write recovery
+cmd/server         приём по HTTP и UDP, запросы, очистка по сроку, обрезка WAL, метрики Prometheus
+cmd/loadgen        имитация парка серверов: датчики, счётчики, редкие ошибки; фазы записи и запросов
+internal/gorilla   битовый поток, кодер, итератор
+internal/store     шардированная карта рядов, чанки, агрегация, срок хранения
+internal/lineproto разбор line protocol без аллокаций
+internal/wal       сегментированный WAL с групповым коммитом и восстановлением оборванных записей
 ```
 
-## Trade-offs and next steps
+## Компромиссы и дальнейшие шаги
 
-- Replay is single-threaded (3.5M samples/s). Periodic snapshots of sealed chunks
-  would bound restart time independently of WAL size.
-- The WAL stores raw line protocol, which is simple and debuggable but about
-  6x larger than the in-memory form; compressing segments with zstd is a small change.
-- Queries address one series at a time. Label matchers across series would need an
-  inverted index from label pairs to series IDs.
+- Проигрывание WAL однопоточное (3,5 млн точек/с). Периодические снимки закрытых чанков
+  ограничили бы время рестарта независимо от размера WAL.
+- WAL хранит исходный line protocol: просто и удобно отлаживать, но примерно в 6 раз
+  больше, чем представление в памяти. Сжатие сегментов через zstd будет небольшим изменением.
+- Запрос обращается к одному ряду. Для фильтров по меткам между рядами нужен инвертированный
+  индекс от пар меток к идентификаторам рядов.
